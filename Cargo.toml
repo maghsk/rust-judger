@@ -7,3 +7,4 @@ edition = "2021"
 
 [dependencies]
 serde_json = "1.0.83"
+process_control = "3.5.1"

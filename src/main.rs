@@ -2,10 +2,15 @@ use std::env;
 use std::fs::canonicalize;
 use std::fs::File;
 use std::io;
-use std::io::prelude::*;
+// use std::io::prelude::*;
+use std::fmt::Debug;
 use std::path::Path;
 use std::process;
-use std::fmt::Debug;
+use std::time::Duration;
+
+use process_control::ChildExt;
+use process_control::Control;
+
 
 use serde_json;
 // use rlimit::Resource;
@@ -14,7 +19,7 @@ const DIFF: &str = "/usr/bin/diff";
 #[derive(Debug)]
 enum ErrorType {
     // CompileError,
-    RuntimeError(i32),
+    RuntimeError(i64),
     // TimeLimitExceeded,
     // MemoryLimitExceeded,
     // OutputLimitExceeded,
@@ -38,37 +43,42 @@ impl From<serde_json::Error> for ErrorType {
     }
 }
 
-
-fn run_single_test_case(prog_path: &Path, in_path: &Path, ans_path: &Path) -> Result<(), ErrorType> {
+fn run_single_test_case(
+    prog_path: &Path,
+    in_path: &Path,
+    ans_path: &Path,
+) -> Result<(), ErrorType> {
     let mut input_file = File::open(in_path)?;
     let mut prog_child = process::Command::new(prog_path)
         .stdin(process::Stdio::piped())
         .stdout(process::Stdio::piped())
-        .stderr(process::Stdio::piped())
+        .stderr(process::Stdio::null())
         .spawn()
         .expect("Failed to spawn child process");
-
-    if let Err(e) = io::copy(&mut input_file, prog_child.stdin.as_mut().unwrap()) {
-        prog_child.kill().ok();
-        return Err(ErrorType::from(e));
-    }
-
-    let result = prog_child.wait_with_output()?;
-    if let Some(code) = result.status.code() {
+    io::copy(&mut input_file, prog_child.stdin.as_mut().unwrap())?;
+    let result = prog_child
+        .controlled()
+        .time_limit(Duration::from_secs(10))
+        .terminate_for_timeout()
+        .wait()?
+        .unwrap();
+    if let Some(code) = result.code() {
         if code == 0 {
-            let mut diff_child = process::Command::new(DIFF)
-                .args(&["-Z", "-B", canonicalize(ans_path).unwrap().to_str().unwrap(), "-"])
-                .stdin(process::Stdio::piped())
-                .spawn()
-                .expect("Failed to spawn diff process");
-            if let Err(e) = diff_child.stdin.as_mut().unwrap().write_all(result.stdout.as_slice()) {
-                diff_child.kill().ok();
-                return Err(ErrorType::from(e));
-            }
-            if let Some(code) = diff_child.wait().unwrap().code() {
+            let diff_output = process::Command::new(DIFF)
+                .args(&[
+                    "-Z",
+                    "-B",
+                    canonicalize(ans_path).unwrap().to_str().unwrap(),
+                    "-",
+                ])
+                .stdin(process::Stdio::from(prog_child.stdout.unwrap()))
+                // .stdout(process::Stdio::piped())
+                .output()?;
+            if let Some(code) = diff_output.status.code() {
                 if code == 0 {
                     Ok(())
                 } else {
+                    // println!("{}", String::from_utf8(diff_output.stdout).unwrap());
                     Err(ErrorType::WrongAnswer)
                 }
             } else {
@@ -92,7 +102,8 @@ fn main() -> Result<(), ErrorType> {
     let prog_path = Path::new(prog_dir.as_str());
     let base_path = Path::new(base_dir.as_str());
 
-    let test_suite: serde_json::Value = serde_json::from_reader(File::open(base_path.join("in_out.json"))?)?;
+    let test_suite: serde_json::Value =
+        serde_json::from_reader(File::open(base_path.join("in_out.json"))?)?;
     for in_out in test_suite.as_array().unwrap().iter() {
         let tmp = in_out.as_array().unwrap();
         let in_path = tmp[0].as_str().unwrap();
